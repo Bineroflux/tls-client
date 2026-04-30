@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/bogdanfinn/tls-client/profiles"
 	"golang.org/x/net/html/charset"
@@ -292,6 +293,43 @@ func BuildResponse(sessionId string, withSession bool, resp *http.Response, cook
 	return response, nil
 }
 
+// ResolveTimeoutOption picks the right tls_client timeout option based on the
+// cffi RequestInput timeout fields; see ResolveTimeout for the mapping.
+func ResolveTimeoutOption(timeoutSeconds, timeoutMilliseconds int) tls_client.HttpClientOption {
+	return tls_client.WithTimeoutMilliseconds(int(ResolveTimeout(timeoutSeconds, timeoutMilliseconds) / time.Millisecond))
+}
+
+// ResolveTimeout maps the cffi RequestInput timeout fields to the client
+// timeout. A request sets at most one of the two fields: CreateClient rejects a
+// request that sets both to non-zero values. For that field:
+//
+//   - 0 (or omitted) → DefaultTimeoutSeconds
+//   - > 0            → that many seconds / milliseconds
+//   - < 0            → 0, which the underlying library interprets as "no deadline"
+//     — required for SSE / long-polling streams
+//
+// (For direct Go callers that pass both: a negative value in either field wins,
+// otherwise milliseconds win over seconds.)
+//
+// The negative sentinel exists because the cffi RequestInput fields are non-pointer
+// ints: 0 cannot be distinguished from "field omitted from JSON", so it has to keep
+// meaning "default" for backwards compatibility. Callers that need a genuinely
+// disabled deadline (e.g. consuming an open-ended event stream) must pass a
+// negative value explicitly.
+func ResolveTimeout(timeoutSeconds, timeoutMilliseconds int) time.Duration {
+	switch {
+	case timeoutSeconds < 0 || timeoutMilliseconds < 0:
+		// 0 in the underlying library means "unlimited" — see WithTimeoutSeconds doc.
+		return 0
+	case timeoutMilliseconds > 0:
+		return time.Duration(timeoutMilliseconds) * time.Millisecond
+	case timeoutSeconds > 0:
+		return time.Duration(timeoutSeconds) * time.Second
+	default:
+		return time.Duration(tls_client.DefaultTimeoutSeconds) * time.Second
+	}
+}
+
 func getTlsClient(requestInput RequestInput, sessionId string, withSession bool) (tls_client.HttpClient, error) {
 	clientsLock.Lock()
 	defer clientsLock.Unlock()
@@ -329,18 +367,8 @@ func getTlsClient(requestInput RequestInput, sessionId string, withSession bool)
 		clientProfile = getTlsClientProfile(tlsClientIdentifier)
 	}
 
-	timeoutOption := tls_client.WithTimeoutSeconds(tls_client.DefaultTimeoutSeconds)
-
-	if requestInput.TimeoutSeconds != 0 {
-		timeoutOption = tls_client.WithTimeoutSeconds(requestInput.TimeoutSeconds)
-	}
-
-	if requestInput.TimeoutMilliseconds != 0 {
-		timeoutOption = tls_client.WithTimeoutMilliseconds(requestInput.TimeoutMilliseconds)
-	}
-
 	options := []tls_client.HttpClientOption{
-		timeoutOption,
+		ResolveTimeoutOption(requestInput.TimeoutSeconds, requestInput.TimeoutMilliseconds),
 		tls_client.WithClientProfile(clientProfile),
 	}
 

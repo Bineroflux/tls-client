@@ -48,6 +48,13 @@ type CookiesFromSessionOutput struct {
 }
 
 // RequestInput is the data a Python client can construct a client and request from.
+//
+// TimeoutSeconds / TimeoutMilliseconds: 0 means "use the default timeout" (30s),
+// a positive value sets an explicit deadline, and a negative value disables the
+// deadline entirely (required for long-lived SSE / streaming responses). Set at
+// most one of the two fields: a request that sets both to non-zero values is
+// rejected. See ResolveTimeout. For a session, the timeout is fixed when the
+// session's client is created by its first request.
 type RequestInput struct {
 	CertificatePinningHosts     map[string][]string `json:"certificatePinningHosts"`
 	CustomTlsClient             *CustomTlsClient    `json:"customTlsClient"`
