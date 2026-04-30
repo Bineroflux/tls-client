@@ -28,6 +28,11 @@ var clientsLock = sync.Mutex{}
 // clients contains all registered clients, mapped by their individual IDs
 var clients = make(map[string]tls_client.HttpClient)
 
+// clientsWithDebug records, per session, whether the cached client was built with
+// WithDebug=true. The logger is fixed when a client is built, so a request that
+// flips WithDebug on an existing session needs a new client (see getTlsClient).
+var clientsWithDebug = make(map[string]bool)
+
 // RemoveSession deletes the client with the given sessionId from the client session storage.
 func RemoveSession(sessionId string) {
 	clientsLock.Lock()
@@ -39,6 +44,7 @@ func RemoveSession(sessionId string) {
 	client.Close()
 
 	delete(clients, sessionId)
+	delete(clientsWithDebug, sessionId)
 }
 
 // ClearSessionCache empties the client session storage.
@@ -51,6 +57,7 @@ func ClearSessionCache() {
 	}
 
 	clients = make(map[string]tls_client.HttpClient)
+	clientsWithDebug = make(map[string]bool)
 }
 
 // GetClient returns the client with the given sessionId from the client session storage.
@@ -345,7 +352,16 @@ func getTlsClient(requestInput RequestInput, sessionId string, withSession bool)
 
 	client, ok := clients[sessionId]
 
-	if ok && withSession {
+	// The logger is fixed when a client is built. If this request asks for a
+	// different WithDebug value than the cached session client was built with, build
+	// a new client below instead of reusing the cached one, otherwise the flag would
+	// have no observable effect. The new client takes over the session's cookie jar
+	// and replaces the cached client, which is then closed. As long as WithDebug does
+	// not change, the cached client is reused as usual.
+	var previous tls_client.HttpClient
+	if ok && withSession && clientsWithDebug[sessionId] != requestInput.WithDebug {
+		previous = client
+	} else if ok && withSession {
 		modifiedClient, changed, err := handleModification(client, proxyUrl, requestInput.FollowRedirects, requestInput.IsRotatingProxy)
 		if err != nil {
 			return nil, fmt.Errorf("failed to modify existing client: %w", err)
@@ -454,7 +470,10 @@ func getTlsClient(requestInput RequestInput, sessionId string, withSession bool)
 		}
 
 		jar, _ := cookiejar.New(nil)
-		if requestInput.WithCustomCookieJar {
+		if previous != nil && previous.GetCookieJar() != nil {
+			// The session client is rebuilt because WithDebug changed: keep its cookies.
+			options = append(options, tls_client.WithCookieJar(previous.GetCookieJar()))
+		} else if requestInput.WithCustomCookieJar {
 			jar := tls_client.NewCookieJar(jarOptions...)
 			options = append(options, tls_client.WithCookieJar(jar))
 		} else {
@@ -488,13 +507,37 @@ func getTlsClient(requestInput RequestInput, sessionId string, withSession bool)
 		options = append(options, tls_client.WithProxyUrl(*proxy))
 	}
 
-	tlsClient, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
+	// Honour WithDebug=true at the cffi layer too. tls_client.WithDebug() (added
+	// to options above) already makes NewHttpClient auto-wrap the supplied logger
+	// via NewDebugLogger, which routes Debug() through fmt.Printf. The catch: the
+	// wrapper only overrides Debug() — Info / Warn / Error keep forwarding through
+	// to the wrapped base logger. With a NewNoopLogger() base, diagnostic calls
+	// like c.logger.Warn("you did not setup a cookie jar") and c.logger.Error(
+	// "critical error during request handling") were silently dropped. Switch the
+	// base to NewLogger() so non-Debug levels also reach stdout. The explicit
+	// NewDebugLogger() wrap is belt-and-suspenders: if a future refactor drops
+	// tls_client.WithDebug() from the options chain, Debug() still surfaces.
+	var clientLogger tls_client.Logger = tls_client.NewNoopLogger()
+	if requestInput.WithDebug {
+		clientLogger = tls_client.NewDebugLogger(tls_client.NewLogger())
+	}
+	tlsClient, err := tls_client.NewHttpClient(clientLogger, options...)
+	if err != nil {
+		return nil, err
+	}
 
 	if withSession {
 		clients[sessionId] = tlsClient
+		clientsWithDebug[sessionId] = requestInput.WithDebug
+
+		if previous != nil {
+			// Like RemoveSession: Close also releases the HTTP/3 UDP sockets of the
+			// replaced client. Requests still in flight on it over HTTP/3 are aborted.
+			previous.Close()
+		}
 	}
 
-	return tlsClient, err
+	return tlsClient, nil
 }
 
 func getCustomTlsClientProfile(customClientDefinition *CustomTlsClient) (tls.ClientHelloID, map[http2.SettingID]uint32, []http2.SettingID, []string, uint32, []http2.Priority, *http2.PriorityParam, uint32, bool, map[uint64]uint64, []uint64, uint32, []string, bool, error) {
