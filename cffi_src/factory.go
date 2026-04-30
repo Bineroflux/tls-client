@@ -306,6 +306,59 @@ func BuildResponse(sessionId string, withSession bool, resp *http.Response, cook
 	return response, nil
 }
 
+// sslKeyLogEnvVar names the environment variable that makes the cffi layer write
+// the TLS session secrets of every connection to a file in the NSS key log
+// format, so Wireshark can decrypt the traffic. It is deliberately specific to
+// tls-client and not the generic SSLKEYLOGFILE that browsers and curl read:
+// SSLKEYLOGFILE is often set machine-wide for browser debugging, and honouring
+// it would make every process that loads tls-client write its secrets to disk
+// without anyone asking for it. To decrypt browser and tls-client traffic in one
+// capture, point both variables at the same file.
+const sslKeyLogEnvVar = "TLS_CLIENT_SSLKEYLOGFILE"
+
+// The key log file is resolved exactly once per process, on the first call to
+// sslKeyLogWriterFromEnv; the writer (or nil, if the variable is unset or the
+// file cannot be opened) is then fixed for the rest of the process lifetime.
+// Doing it this way:
+//
+//   - reads os.Getenv at most once instead of on every getTlsClient call
+//   - shares one append-mode writer across all TLS connections, which is
+//     exactly the contract Wireshark / NSS expect (one master-secret line
+//     per CR/LF, all collated into one file)
+//   - intentionally ignores mid-process changes to the variable — chasing
+//     env mutations would only matter for a debug feature where session
+//     log continuity is more useful than reactivity.
+var (
+	sslKeyLogOnce   sync.Once
+	sslKeyLogWriter io.Writer
+)
+
+// sslKeyLogWriterFromEnv returns the key log writer for TLS_CLIENT_SSLKEYLOGFILE,
+// or nil if the variable was unset at the first call or the file could not be
+// opened.
+func sslKeyLogWriterFromEnv() io.Writer {
+	sslKeyLogOnce.Do(func() {
+		sslKeyLogWriter = openSSLKeyLogFile(os.Getenv(sslKeyLogEnvVar))
+	})
+	return sslKeyLogWriter
+}
+
+// openSSLKeyLogFile opens path for appending TLS secrets. It returns nil for an
+// empty path or when the file cannot be opened. Because the file holds secrets
+// that decrypt every connection, it warns on stderr when key logging is on.
+func openSSLKeyLogFile(path string) io.Writer {
+	if path == "" {
+		return nil
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "tls-client: failed to open %s %q: %v\n", sslKeyLogEnvVar, path, err)
+		return nil
+	}
+	fmt.Fprintf(os.Stderr, "tls-client: %s is set, writing TLS session secrets to %q; use this for debugging only\n", sslKeyLogEnvVar, path)
+	return f
+}
+
 // ResolveTimeoutOption picks the right tls_client timeout option based on the
 // cffi RequestInput timeout fields; see ResolveTimeout for the mapping.
 func ResolveTimeoutOption(timeoutSeconds, timeoutMilliseconds int) tls_client.HttpClientOption {
@@ -439,7 +492,23 @@ func getTlsClient(requestInput RequestInput, sessionId string, withSession bool)
 			// RootCAs:                requestInput.TransportOptions.RootCAs,
 		}
 
+		// The cffi TransportOptions JSON cannot carry a writer, so the key log
+		// writer can only come from TLS_CLIENT_SSLKEYLOGFILE.
+		if w := sslKeyLogWriterFromEnv(); w != nil {
+			transportOptions.KeyLogWriter = w
+		}
 		options = append(options, tls_client.WithTransportOptions(transportOptions))
+	} else if w := sslKeyLogWriterFromEnv(); w != nil {
+		// Honour TLS_CLIENT_SSLKEYLOGFILE even when the caller didn't pass
+		// TransportOptions — avoids forcing every cffi consumer to construct an empty
+		// TransportOptions just to enable Wireshark TLS decryption. The zero-valued
+		// fields of the TransportOptions below match the "no transportOptions"
+		// defaults in roundtripper.go; the HTTP/2 transport additionally gets an
+		// HTTP/1 transport via SetT1, but every field it reads from it is zero too.
+		// So the only behavioural difference is the attached KeyLogWriter.
+		options = append(options, tls_client.WithTransportOptions(&tls_client.TransportOptions{
+			KeyLogWriter: w,
+		}))
 	}
 
 	if requestInput.LocalAddress != nil {
