@@ -33,6 +33,7 @@ This TLS Client allows you to specify the Client (Browser and Version) you want 
 - ✅ **Cookie Jar Management** - Built-in cookie handling
 - ✅ **Certificate Pinning** - Enhanced security with custom certificate validation
 - ✅ **Bandwidth Tracking** - Monitor upload/download bandwidth
+- ✅ **Response Streaming** - Consume SSE, NDJSON, and chunked responses incrementally via cffi
 - ✅ **Language Bindings** - Use from JavaScript (Node.js), Python, and C# via FFI
 
 ### Interface
@@ -131,6 +132,147 @@ func main() {
 	log.Println(string(readBytes))
 }
 ```
+
+---
+
+### Using the Library via CGo / Native Shared Library (cffi)
+
+In addition to being imported as a Go module, tls-client can be compiled into a shared library (`.so` / `.dll` / `.dylib`) and called from any language that supports C FFI — Python (`ctypes`), Node.js (`ffi-napi` / `ffi-rs`), C#, Rust, etc.  
+The shared library is built from `cffi_dist/` with `go build -buildmode=c-shared` (CGO enabled); see `cffi_dist/build.sh` for the per-platform commands.  
+`cffi_dist` is a module of its own that builds against the tls-client version pinned in `cffi_dist/go.mod`, not against the checkout around it. To build the library from local changes to `cffi_src/` (e.g. before they are released), create a Go workspace that uses both modules — `go work init . ./cffi_dist` in the repository root, and do not commit the `go.work` file — and run the build in `cffi_dist/`.
+
+The following exports are available:
+
+| Export | Input | Description |
+|---|---|---|
+| `request` | `RequestInput` JSON | Send a request and receive the full response body in one call |
+| `requestStream` | `RequestInput` JSON | Send a request and return as soon as the response **headers** arrive, together with a `streamId`; the body keeps streaming in the background |
+| `readStream` | `{ "streamId", "timeoutMs" }` | Fetch the next body chunk of a live stream; `timeoutMs` controls how long to wait (see below) |
+| `readStreamAll` | `{ "streamId" }` | Drain all remaining body bytes in one call and return a normal response envelope |
+| `cancelStream` | `{ "streamId" }` | Abort a stream early and release its resources; idempotent, also safe after EOF or an error |
+| `wsConnect` | `WsConnectInput` JSON (`url`, plus `sessionId` or `tlsClientIdentifier` / `customTlsClient`, ...) | Open a WebSocket connection with the same TLS fingerprint and return a `connectionId` |
+| `wsRead` | `{ "connectionId", "timeoutMilliseconds" }` | Read the next message (`messageType` 1 = text, 2 = binary with base64 `data`); `0` waits indefinitely |
+| `wsWrite` | `{ "connectionId", "data", "messageType", "timeoutMilliseconds" }` | Send a text or binary (base64) message |
+| `wsClose` | `{ "connectionId" }` | Close a WebSocket connection |
+| `wsStats` | `{ "connectionId" }` | Return diagnostic counters for a WebSocket connection |
+| `destroySession` | `{ "sessionId" }` | Remove a named session and close its connections |
+| `destroyAll` | none | Remove all sessions (closing their connections) and cancel all active streams |
+| `getCookiesFromSession` | `{ "sessionId", "url" }` | Return cookies stored in a named session for a given URL |
+| `addCookiesToSession` | `{ "sessionId", "url", "cookies" }` | Inject cookies into a named session for a given URL |
+| `freeMemory` | envelope `id` as a plain C string (not JSON) | Release the memory of a returned envelope; returns nothing |
+
+Every export except `freeMemory` returns a `char*` pointing to a JSON envelope that carries an `id`.  
+The caller **must** call `freeMemory(envelope.id)` for every returned envelope to avoid leaks — after copying or parsing the string, because the pointer is invalid afterwards.  
+If a call fails (invalid input JSON, the request cannot be sent, ...), the envelope has the normal response shape with `"status": 0` and the error message in `body`. This also applies to `requestStream` (the envelope then has no `streamId`), to `readStreamAll` and to the `ws*` exports (including a `wsRead` timeout). `readStream` instead reports read failures and unknown stream IDs in its `error` field (see below).
+
+#### Request / Response JSON shape
+
+`request` and `requestStream` take the same `RequestInput` shape. Key fields:
+
+```json
+{
+  "requestMethod": "GET",
+  "requestUrl": "https://example.com",
+  "tlsClientIdentifier": "chrome_150",
+  "sessionId": "my-session",
+  "timeoutSeconds": 30,
+  "followRedirects": true,
+  "headers": { "accept": "*/*" },
+  "headerOrder": ["accept"],
+  "requestCookies": [],
+  "isByteResponse": false,
+  "streamOutputBlockSize": 4096
+}
+```
+
+- `timeoutSeconds` / `timeoutMilliseconds`: `0` (or omitted) uses the default of 30 s, a positive value sets a deadline, and a **negative value** (e.g. `-1`) disables the deadline. Set at most one of the two fields: a request that sets both to non-zero values fails. The deadline covers the whole response including reading the body, so use a negative value for long-lived SSE / chunked streams, otherwise it fires mid-stream. With a `sessionId`, the timeout is fixed by the request that creates the session; later requests on that session cannot change it.
+- `streamOutputBlockSize`: with `requestStream`, the maximum size in bytes of one chunk (default 4096).
+- `isByteResponse`: with `requestStream`, this only affects `readStreamAll` (body returned as a `data:<mime>;base64,...` URL). `readStream` chunks are always base64-encoded.
+
+#### Response Streaming
+
+The four streaming exports let you consume Server-Sent Events, NDJSON feeds, or any other long-lived chunked response without buffering the entire body before returning.
+
+**Flow:**
+
+1. Call `requestStream`. It returns once the response headers are in, with the usual response envelope (`status`, `headers`, `cookies`, `target`, `usedProtocol`, an empty `body`) plus a `streamId`.
+2. Loop calling `readStream` with `{ "streamId": "<id>", "timeoutMs": 5000 }` to fetch one chunk at a time.  
+   `timeoutMs`: `0` (or omitted) polls without blocking, a positive value waits up to that many milliseconds, a negative value blocks until data, EOF or an error arrives.  
+   Each chunk envelope has the shape `{ "id": "...", "streamId": "...", "chunk": "<base64>", "eof": false, "timeout": false }`, plus an `error` field only when a read failed. Exactly one of these is set:
+
+   | Field | Meaning |
+   |---|---|
+   | `chunk` (non-empty) | The next slice of the body: decompressed raw bytes, base64-encoded, without charset conversion |
+   | `timeout: true` | No data arrived within `timeoutMs`; the stream is still alive, call `readStream` again |
+   | `eof: true` | The body is complete; the `streamId` is no longer valid |
+   | `error` | Reading the body failed (e.g. the server reset the HTTP/2 stream); the `streamId` is no longer valid |
+
+3. Call `cancelStream` in your `finally` block to release the connection, even on early exit.
+
+Alternatively, call `readStreamAll` after `requestStream` (or after some `readStream` calls) to drain the rest of the body in one shot — useful when the response turns out not to be a stream after all. It returns the same envelope shape as `request`.
+
+The Go side buffers up to 64 chunks per stream. If that buffer is full and the caller does not read for 60 seconds, the stream is torn down: after the chunks already buffered, `readStream` reports an `error` starting with `stream aborted`, and `readStreamAll` fails, because the body is incomplete. As soon as the body has ended, its connection is released; the buffered chunks stay readable. A stream whose body has ended but that is not read for 5 minutes is discarded, and later reads report an unknown `streamId`. So keep reading, or call `cancelStream`.
+
+With `withDebug: true`, tls-client reads the whole body before `requestStream` returns, to log it. The response is then not streamed, so do not combine the two for long-lived streams.
+
+**Python example (SSE / NDJSON):**
+
+```python
+import base64, codecs, ctypes, json
+
+# Load the library built for your platform, e.g. tls-client-linux-ubuntu-amd64-<version>.so
+lib = ctypes.cdll.LoadLibrary("./tls-client.so")
+
+for fn in (lib.requestStream, lib.readStream, lib.readStreamAll, lib.cancelStream):
+    fn.argtypes = [ctypes.c_char_p]
+    fn.restype = ctypes.c_char_p   # ctypes copies the returned C string into Python bytes
+
+lib.freeMemory.argtypes = [ctypes.c_char_p]
+lib.freeMemory.restype = None      # freeMemory returns nothing
+
+def call(fn, payload):
+    raw = fn(json.dumps(payload).encode("utf-8"))
+    envelope = json.loads(raw.decode("utf-8"))       # parse first ...
+    lib.freeMemory(envelope["id"].encode("utf-8"))   # ... then release the C string
+    return envelope
+
+# 1. Start the stream
+start = call(lib.requestStream, {
+    "requestMethod": "GET",
+    "requestUrl": "https://httpbin.org/stream/5",
+    "tlsClientIdentifier": "chrome_150",
+    "timeoutSeconds": -1,   # no deadline for long-lived streams
+})
+if start.get("status", 0) == 0:
+    raise RuntimeError(f"requestStream failed: {start.get('body')}")
+stream_id = start["streamId"]
+
+# 2. Read chunks until EOF
+decoder = codecs.getincrementaldecoder("utf-8")()  # a UTF-8 character may span two chunks
+try:
+    while True:
+        chunk = call(lib.readStream, {"streamId": stream_id, "timeoutMs": 5000})
+        if chunk.get("error"):
+            raise RuntimeError(f"stream failed: {chunk['error']}")
+        if chunk.get("timeout"):
+            continue        # nothing yet, but the stream is still alive: poll again
+        if chunk.get("chunk"):
+            print(decoder.decode(base64.b64decode(chunk["chunk"])), end="", flush=True)
+        if chunk.get("eof"):
+            print(decoder.decode(b"", final=True), end="")
+            break
+finally:
+    # 3. Always cancel to release the connection (idempotent, safe after EOF or an error)
+    call(lib.cancelStream, {"streamId": stream_id})
+```
+
+A complete, commented Python example (including `readStreamAll`) is in `cffi_dist/example_python/example_stream.py`. The Node.js, TypeScript and C# examples in `cffi_dist/` only cover the non-streaming exports.
+
+#### Decrypting the traffic with Wireshark
+
+Set the environment variable `TLS_CLIENT_SSLKEYLOGFILE` to a file path before the process loads the library. The shared library then appends the TLS session secrets of every connection to that file in the NSS key log format, which Wireshark reads (Preferences → Protocols → TLS → (Pre)-Master-Secret log filename). The variable is read once, when the first client is created, and tls-client prints a warning to stderr while key logging is on. The generic `SSLKEYLOGFILE` that browsers and curl read is deliberately ignored, so a machine-wide setting for browser debugging does not make every application that uses tls-client write its secrets to disk; to capture both in one file, point both variables at the same path. Use this for debugging only: anyone with the file can decrypt the captured traffic.
+
+---
 
 ### Questions?
 

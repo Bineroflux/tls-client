@@ -89,7 +89,7 @@ def call(fn, payload):
 #                             For finite streams a generous positive value
 #                             is fine.
 requestPayload = {
-    "tlsClientIdentifier": "chrome_124",
+    "tlsClientIdentifier": "chrome_150",
     "followRedirects": True,
     "timeoutSeconds": 30,
     "streamOutputBlockSize": 4096,
