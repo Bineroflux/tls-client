@@ -207,6 +207,14 @@ The four streaming exports let you consume Server-Sent Events, NDJSON feeds, or 
    | `eof: true` | The body is complete; the `streamId` is no longer valid |
    | `error` | Reading the body failed (e.g. the server reset the HTTP/2 stream); the `streamId` is no longer valid |
 
+   When an HTTP/2 stream ends abnormally, the `error` text says which side ended it. The original transport error always stays at the end of the message:
+   - `http2 stream reset by remote peer (RST_STREAM, code ...)`: the server, or a proxy / CDN in front of it, aborted the stream.
+   - `http2 stream ended with PROTOCOL_ERROR and no further detail`: either the server sent `RST_STREAM(PROTOCOL_ERROR)` or tls-client rejected a malformed frame; the transport reports both the same way.
+   - `http2 stream aborted by the local transport (code ...)`: tls-client rejected malformed data from the server, e.g. an invalid header field.
+   - `http2 connection closed by remote peer after GOAWAY`: the server closed the whole connection.
+
+   `readStreamAll` and `request` report a failed body read with the same texts in `body`. The peer-reset detection also recognizes the `received from peer` marker that newer `golang.org/x/net` versions set, by its text.
+
 3. Call `cancelStream` in your `finally` block to release the connection, even on early exit.
 
 Alternatively, call `readStreamAll` after `requestStream` (or after some `readStream` calls) to drain the rest of the body in one shot — useful when the response turns out not to be a stream after all. It returns the same envelope shape as `request`.

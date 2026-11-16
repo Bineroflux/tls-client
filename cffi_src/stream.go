@@ -286,7 +286,11 @@ func pumpStream(state *StreamState, blockSize int) {
 			return
 		}
 		if readErr != nil {
-			sendChunk(state.Chunks, StreamChunk{Err: readErr})
+			// Enrich before handing off so both consumers (ReadStreamChunk's
+			// finalizeChunk and ReadStreamAll) report WHY the stream died, most
+			// importantly whether the remote peer reset it (RST_STREAM) or the
+			// local http2 transport aborted it. See describeStreamReadError.
+			sendChunk(state.Chunks, StreamChunk{Err: describeStreamReadError(readErr)})
 			return
 		}
 	}

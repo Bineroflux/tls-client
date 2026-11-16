@@ -210,6 +210,7 @@ func readAllBodyWithStreamToFile(respBody io.Reader, input RequestInput) ([]byte
 }
 
 // BuildResponse constructs a client response from a given HTTP response. The client response can then be sent to the interface consumer.
+// A failed body read is enriched with describeStreamReadError, like a failed streamed read.
 func BuildResponse(sessionId string, withSession bool, resp *http.Response, cookies []*http.Cookie, input RequestInput) (Response, *TLSClientError) {
 	defer resp.Body.Close()
 
@@ -234,7 +235,7 @@ func BuildResponse(sessionId string, withSession bool, resp *http.Response, cook
 		firstByte := make([]byte, 1)
 		n, err := io.ReadFull(resp.Body, firstByte)
 		if err != nil && !errors.Is(err, io.EOF) {
-			return Response{}, NewTLSClientError(err)
+			return Response{}, NewTLSClientError(describeStreamReadError(err))
 		}
 
 		if n == 0 {
@@ -249,7 +250,7 @@ func BuildResponse(sessionId string, withSession bool, resp *http.Response, cook
 			if input.StreamOutputPath == nil {
 				bodyReader, err = charset.NewReader(bodyReader, ct)
 				if err != nil {
-					return Response{}, NewTLSClientError(err)
+					return Response{}, NewTLSClientError(describeStreamReadError(err))
 				}
 			}
 
@@ -259,7 +260,7 @@ func BuildResponse(sessionId string, withSession bool, resp *http.Response, cook
 				respBodyBytes, err = io.ReadAll(bodyReader)
 			}
 			if err != nil {
-				return Response{}, NewTLSClientError(err)
+				return Response{}, NewTLSClientError(describeStreamReadError(err))
 			}
 		}
 	} else {
@@ -271,7 +272,7 @@ func BuildResponse(sessionId string, withSession bool, resp *http.Response, cook
 		}
 
 		if err != nil {
-			return Response{}, NewTLSClientError(err)
+			return Response{}, NewTLSClientError(describeStreamReadError(err))
 		}
 	}
 
