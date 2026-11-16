@@ -43,6 +43,7 @@ func freeMemory(responseId *C.char) {
 //export destroyAll
 func destroyAll() *C.char {
 	tls_client_cffi_src.ClearSessionCache()
+	tls_client_cffi_src.ClearStreamCache()
 
 	out := tls_client_cffi_src.DestroyOutput{
 		Id:      uuid.New().String(),
@@ -280,6 +281,128 @@ func request(requestParams *C.char) *C.char {
 
 	unsafePointersLck.Lock()
 	unsafePointers[response.Id] = responseString
+	unsafePointersLck.Unlock()
+
+	return responseString
+}
+
+//export requestStream
+func requestStream(requestParams *C.char) *C.char {
+	requestParamsJson := C.GoString(requestParams)
+
+	requestInput := tls_client_cffi_src.RequestInput{}
+	marshallError := json.Unmarshal([]byte(requestParamsJson), &requestInput)
+
+	if marshallError != nil {
+		clientErr := tls_client_cffi_src.NewTLSClientError(marshallError)
+		return handleErrorResponse("", false, clientErr)
+	}
+
+	out, sessionId, withSession, err := tls_client_cffi_src.StartRequestStream(requestInput, buildCookies(requestInput.RequestCookies))
+	if err != nil {
+		return handleErrorResponse(sessionId, withSession, err)
+	}
+
+	jsonResponse, marshallError := json.Marshal(out)
+	if marshallError != nil {
+		tls_client_cffi_src.CancelStream(out.StreamId)
+		clientErr := tls_client_cffi_src.NewTLSClientError(marshallError)
+		return handleErrorResponse(sessionId, withSession, clientErr)
+	}
+
+	responseString := C.CString(string(jsonResponse))
+
+	unsafePointersLck.Lock()
+	unsafePointers[out.Id] = responseString
+	unsafePointersLck.Unlock()
+
+	return responseString
+}
+
+//export readStream
+func readStream(readStreamParams *C.char) *C.char {
+	readStreamParamsJson := C.GoString(readStreamParams)
+
+	input := tls_client_cffi_src.ReadStreamInput{}
+	if marshallError := json.Unmarshal([]byte(readStreamParamsJson), &input); marshallError != nil {
+		clientErr := tls_client_cffi_src.NewTLSClientError(marshallError)
+		return handleErrorResponse("", false, clientErr)
+	}
+
+	out := tls_client_cffi_src.ReadStreamChunk(input.StreamId, input.TimeoutMs)
+
+	jsonResponse, marshallError := json.Marshal(out)
+	if marshallError != nil {
+		clientErr := tls_client_cffi_src.NewTLSClientError(marshallError)
+		return handleErrorResponse("", false, clientErr)
+	}
+
+	responseString := C.CString(string(jsonResponse))
+
+	unsafePointersLck.Lock()
+	unsafePointers[out.Id] = responseString
+	unsafePointersLck.Unlock()
+
+	return responseString
+}
+
+//export readStreamAll
+func readStreamAll(readStreamAllParams *C.char) *C.char {
+	readStreamAllParamsJson := C.GoString(readStreamAllParams)
+
+	input := tls_client_cffi_src.ReadStreamAllInput{}
+	if marshallError := json.Unmarshal([]byte(readStreamAllParamsJson), &input); marshallError != nil {
+		clientErr := tls_client_cffi_src.NewTLSClientError(marshallError)
+		return handleErrorResponse("", false, clientErr)
+	}
+
+	response, drainErr := tls_client_cffi_src.ReadStreamAll(input.StreamId)
+	if drainErr != nil {
+		return handleErrorResponse("", false, drainErr)
+	}
+
+	jsonResponse, marshallError := json.Marshal(response)
+	if marshallError != nil {
+		clientErr := tls_client_cffi_src.NewTLSClientError(marshallError)
+		return handleErrorResponse("", false, clientErr)
+	}
+
+	responseString := C.CString(string(jsonResponse))
+
+	unsafePointersLck.Lock()
+	unsafePointers[response.Id] = responseString
+	unsafePointersLck.Unlock()
+
+	return responseString
+}
+
+//export cancelStream
+func cancelStream(cancelStreamParams *C.char) *C.char {
+	cancelStreamParamsJson := C.GoString(cancelStreamParams)
+
+	input := tls_client_cffi_src.CancelStreamInput{}
+	if marshallError := json.Unmarshal([]byte(cancelStreamParamsJson), &input); marshallError != nil {
+		clientErr := tls_client_cffi_src.NewTLSClientError(marshallError)
+		return handleErrorResponse("", false, clientErr)
+	}
+
+	tls_client_cffi_src.CancelStream(input.StreamId)
+
+	out := tls_client_cffi_src.DestroyOutput{
+		Id:      uuid.New().String(),
+		Success: true,
+	}
+
+	jsonResponse, marshallError := json.Marshal(out)
+	if marshallError != nil {
+		clientErr := tls_client_cffi_src.NewTLSClientError(marshallError)
+		return handleErrorResponse("", false, clientErr)
+	}
+
+	responseString := C.CString(string(jsonResponse))
+
+	unsafePointersLck.Lock()
+	unsafePointers[out.Id] = responseString
 	unsafePointersLck.Unlock()
 
 	return responseString
