@@ -1,0 +1,115 @@
+name: build-darwin
+
+# Builds the cffi shared library for macOS arm64 natively on an Apple Silicon
+# runner (no Apple SDK on non-Apple hardware) and tests it there: Python
+# streaming smoke test, the TlsClient.NET native test suite, and a NuGet
+# consumer that loads the library through TlsClient.Native.darwin-arm64.
+# TlsClient.NET is checked out from the same-named branch of its fork.
+
+on:
+  push:
+    branches: [ci/macos]
+  workflow_dispatch:
+
+jobs:
+  darwin-arm64:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      # Lowest macOS the dylib declares (LC_BUILD_VERSION minos). Without it
+      # clang targets the runner's own macOS version.
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: tls-client
+
+      - uses: actions/checkout@v7
+        with:
+          repository: Bineroflux/TlsClient.NET
+          ref: ${{ github.ref_name }}
+          path: TlsClient.NET
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: tls-client/cffi_dist/go.mod
+          cache-dependency-path: tls-client/cffi_dist/go.sum
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: |
+            9.0.x
+            10.0.x
+
+      - name: Build the dylib against the local tls-client source
+        working-directory: tls-client/cffi_dist
+        run: |
+          set -euo pipefail
+          version="$(sed -nE 's/^[[:space:]]*github\.com\/bogdanfinn\/tls-client[[:space:]]+v([^[:space:]]+).*/\1/p' go.mod | head -n1)"
+          name="tls-client-darwin-arm64-${version}-stream"
+          echo "LIB_NAME=$name" >> "$GITHUB_ENV"
+          echo "LIB_PATH=$PWD/dist/$name.dylib" >> "$GITHUB_ENV"
+          echo "TLS_VERSION=${version}-stream" >> "$GITHUB_ENV"
+
+          # Throw-away workspace so cffi_dist builds against ../ instead of the
+          # published module its go.mod requires (as build-dll.ps1 / build-so.sh do).
+          mkdir -p "$RUNNER_TEMP/gowork"
+          (cd "$RUNNER_TEMP/gowork" && GOWORK=off go work init "$GITHUB_WORKSPACE/tls-client" "$GITHUB_WORKSPACE/tls-client/cffi_dist")
+          export GOWORK="$RUNNER_TEMP/gowork/go.work"
+
+          go version
+          CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -buildmode=c-shared -o "dist/$name.dylib" .
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Inspect the dylib (exports, signature, minimum macOS)
+        run: |
+          set -euo pipefail
+          file "$LIB_PATH"
+          ls -l "$LIB_PATH"
+          missing=""
+          for e in freeMemory destroyAll destroySession getCookiesFromSession addCookiesToSession \
+                   request requestStream readStream readStreamAll cancelStream \
+                   wsConnect wsRead wsWrite wsClose wsStats; do
+            nm -gU "$LIB_PATH" | grep -q " _$e\$" || missing="$missing $e"
+          done
+          if [ -n "$missing" ]; then echo "::error::missing cffi exports:$missing"; exit 1; fi
+          echo "all 15 cffi exports present"
+          codesign -dv --verbose=2 "$LIB_PATH" 2>&1
+          codesign --verify --verbose "$LIB_PATH"
+          otool -l "$LIB_PATH" | grep -A4 LC_BUILD_VERSION
+          otool -L "$LIB_PATH"
+
+      - name: Python streaming smoke test
+        working-directory: tls-client/cffi_dist/example_python
+        run: TLS_CLIENT_LIBRARY="$LIB_PATH" python3 -I example_stream.py
+
+      - name: TlsClient.Native test suite
+        working-directory: TlsClient.NET
+        run: TLS_CLIENT_NATIVE_DLL="$LIB_PATH" dotnet test tests/TlsClient.Native.Tests --logger "console;verbosity=normal"
+
+      - name: Pack TlsClient.Native.darwin-arm64 and run a NuGet consumer
+        working-directory: TlsClient.NET
+        run: |
+          set -euo pipefail
+          pkg="$(sed -nE 's/.*<Version>([^<]+)<\/Version>.*/\1/p' src/TlsClient.Native/TlsClient.Native.csproj | head -n1)"
+          mkdir -p build/temp feed
+          cp "$LIB_PATH" "build/temp/tls-client-xgo-${TLS_VERSION}-darwin-arm64.dylib"
+          GITHUB_WORKSPACE="$PWD" TLS_CLIENT_VERSION="$TLS_VERSION" PACKAGE_VERSION="$pkg" node build/native-builder/prepare.js
+          for p in src/TlsClient.Core/TlsClient.Core.csproj \
+                   src/TlsClient.Native/TlsClient.Native.csproj \
+                   src/native/TlsClient.Native.darwin-arm64/TlsClient.Native.darwin-arm64.csproj; do
+            dotnet pack "$p" -c Release -o feed --nologo "-p:Version=$pkg"
+          done
+          unzip -l "feed/TlsClient.Native.darwin-arm64.$pkg.nupkg"
+          # Initialize(null): the library must be found via runtimes/osx-arm64/native/.
+          dotnet run --project ci/macos-smoke -c Release "--property:TlsClientPackageVersion=$pkg"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: tls-client-darwin-arm64
+          if-no-files-found: warn
+          path: |
+            tls-client/cffi_dist/dist/*.dylib
+            tls-client/cffi_dist/dist/*.h
+            TlsClient.NET/feed/TlsClient.Native.darwin-arm64.*.nupkg
